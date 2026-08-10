@@ -120,19 +120,7 @@ VISITOR_PORT = 3129
 #: the port refused.
 _BRIDGE = """
 import asyncio, json, sys
-
-async def splice(reader, writer):
-    try:
-        while chunk := await reader.read(65536):
-            writer.write(chunk)
-            await writer.drain()
-    except Exception:
-        pass
-    finally:
-        try:
-            writer.close()
-        except Exception:
-            pass
+from hud.environment.utils import splice
 
 def bridged(path):
     async def handle(reader, writer):
@@ -141,7 +129,7 @@ def bridged(path):
         except OSError:
             writer.close()
             return
-        await asyncio.gather(splice(reader, up_writer), splice(up_reader, writer))
+        await splice((reader, writer), (up_reader, up_writer))
     return handle
 
 async def main():
@@ -304,9 +292,10 @@ def _connect_public(host: str, port: int, timeout: float) -> socket.socket:
 
 
 def _relay(one: socket.socket, other: socket.socket, timeout: float = 300.0) -> None:
-    """Copy bytes between two connected sockets until either end is done."""
-    while True:
-        ready, _, _ = select.select([one, other], [], [], timeout)
+    """Copy bytes until both directions reach EOF, error, or the connection stalls."""
+    readers = [one, other]
+    while readers:
+        ready, _, _ = select.select(readers, [], [], timeout)
         if not ready:
             return
         for source in ready:
@@ -314,7 +303,9 @@ def _relay(one: socket.socket, other: socket.socket, timeout: float = 300.0) -> 
             try:
                 data = source.recv(65536)
                 if not data:
-                    return
+                    readers.remove(source)
+                    target.shutdown(socket.SHUT_WR)
+                    continue
                 target.sendall(data)
             except OSError:
                 return
