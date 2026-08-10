@@ -188,7 +188,7 @@ class SSHClient(CapabilityClient):
         *,
         timeout_s: float | None = None,
     ) -> None:
-        """Write UTF-8 text through the exec channel without command interpolation."""
+        """Atomically write UTF-8 text through the exec channel."""
         if self._is_windows:
             loop = asyncio.get_running_loop()
             deadline = loop.time() + timeout_s if timeout_s is not None else None
@@ -197,21 +197,69 @@ class SSHClient(CapabilityClient):
                 return None if deadline is None else max(0.0, deadline - loop.time())
 
             quoted = _powershell_quote(path)
-            truncate = f"[IO.File]::WriteAllBytes({quoted},[byte[]]@())"
-            await self.run(_powershell(truncate), check=True, timeout=remaining_timeout())
+            prepare = (
+                "$ErrorActionPreference='Stop';$t=$null;try{"
+                f"$d=[IO.Path]::GetFullPath({quoted});"
+                "for($i=0;[IO.File]::Exists($d) -and $i -lt 40;$i++){"
+                "$item=Get-Item -Force -LiteralPath $d;"
+                "if(($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0){break};"
+                "$link=[string]$item.Target;"
+                "$d=if([IO.Path]::IsPathRooted($link)){[IO.Path]::GetFullPath($link)}"
+                "else{[IO.Path]::GetFullPath((Join-Path $item.DirectoryName $link))}"
+                "};if($i -eq 40){throw 'too many symbolic links'};"
+                "$dir=[IO.Path]::GetDirectoryName($d);"
+                "if([string]::IsNullOrEmpty($dir)){$dir=[Environment]::CurrentDirectory};"
+                "$t=Join-Path $dir ('.hud-write-'+[IO.Path]::GetRandomFileName());"
+                "$f=[IO.File]::Open($t,[IO.FileMode]::CreateNew,"
+                "[IO.FileAccess]::Write,[IO.FileShare]::None);$f.Dispose();"
+                '[Console]::Out.Write($d+"`n"+$t)'
+                "}catch{if($null -ne $t -and [IO.File]::Exists($t))"
+                "{[IO.File]::Delete($t)};throw}"
+            )
+            result = await self.run(_powershell(prepare), check=True, timeout=remaining_timeout())
+            destination, staged = _stdout(result).splitlines()
+            quoted_destination = _powershell_quote(destination)
+            quoted_staged = _powershell_quote(staged)
             raw = content.encode("utf-8")
             for offset in range(0, len(raw), 6144):
                 payload = base64.b64encode(raw[offset : offset + 6144]).decode("ascii")
                 script = (
+                    "$ErrorActionPreference='Stop';try{"
                     f"$b=[Convert]::FromBase64String('{payload}');"
-                    f"$f=[IO.File]::Open({quoted},[IO.FileMode]::Append,"
-                    "[IO.FileAccess]::Write,[IO.FileShare]::Read);"
+                    f"$f=[IO.File]::Open({quoted_staged},[IO.FileMode]::Append,"
+                    "[IO.FileAccess]::Write,[IO.FileShare]::None);"
                     "try{$f.Write($b,0,$b.Length)}finally{$f.Dispose()}"
+                    f"}}catch{{if([IO.File]::Exists({quoted_staged}))"
+                    f"{{[IO.File]::Delete({quoted_staged})}};throw}}"
                 )
                 await self.run(_powershell(script), check=True, timeout=remaining_timeout())
+            commit = (
+                "$ErrorActionPreference='Stop';"
+                f"$d={quoted_destination};$t={quoted_staged};"
+                "$n=[System.Management.Automation.Language.NullString]::Value;try{"
+                "if([IO.File]::Exists($d)){"
+                "$p=[Security.Principal.SecurityIdentifier];"
+                "$o=[IO.File]::GetAccessControl($d).GetOwner($p);"
+                "$a=[Security.AccessControl.FileSecurity]::new();$a.SetOwner($o);"
+                "[IO.File]::SetAccessControl($t,$a);"
+                "[IO.File]::Replace($t,$d,$n)}"
+                "else{[IO.File]::Move($t,$d)}"
+                "}finally{if([IO.File]::Exists($t)){[IO.File]::Delete($t)}}"
+            )
+            await self.run(_powershell(commit), check=True, timeout=remaining_timeout())
             return
+        quoted = shlex.quote(path)
+        command = (
+            f'd={quoted};n=0;while [ -L "$d" ];do '
+            "n=$((n+1));[ \"$n\" -le 40 ]||{ echo 'too many symbolic links' >&2;exit 1;};"
+            'link=$(readlink -- "$d");case $link in /*)d=$link;;*)d=$(dirname -- "$d")/$link;;esac;'
+            'done;dir=$(dirname -- "$d");t=$(mktemp "$dir/.hud-write.XXXXXX")||exit;'
+            "trap '[ -z \"$t\" ] || rm -f -- \"$t\"' EXIT;trap 'exit 1' HUP INT TERM;"
+            'if [ -e "$d" ];then cp -p -- "$d" "$t"||exit;else chmod =rw "$t"||exit;fi;'
+            'cat > "$t"||exit;mv -f -- "$t" "$d"||exit;t='
+        )
         await self.run(
-            f"cat > {shlex.quote(path)}",
+            command,
             input=content,
             check=True,
             timeout=timeout_s,

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import re
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock
 
@@ -15,10 +17,11 @@ if TYPE_CHECKING:
 
 
 class _Completed:
-    stdout = "ok"
-    stderr = ""
-    exit_status = 0
-    returncode: int | None = 0
+    def __init__(self, stdout: str = "ok") -> None:
+        self.stdout = stdout
+        self.stderr = ""
+        self.exit_status = 0
+        self.returncode: int | None = 0
 
 
 class _Process:
@@ -125,6 +128,12 @@ def _capability() -> Capability:
 
 def _client(connection: object) -> SSHClient:
     return SSHClient(_capability(), cast("asyncssh.SSHClientConnection", connection))
+
+
+def _decode_powershell(command: object) -> str:
+    assert isinstance(command, str)
+    encoded = command.rsplit(" ", maxsplit=1)[1]
+    return base64.b64decode(encoded).decode("utf-16-le")
 
 
 async def test_connect_keeps_tunneled_connection_active(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -305,14 +314,99 @@ async def test_windows_write_uses_one_timeout_budget(
         assert isinstance(timeout, float)
         timeouts.append(timeout)
         await asyncio.sleep(0.01)
+        if len(timeouts) == 1:
+            return _Completed("C:\\file.txt\nC:\\.hud-write.tmp")
         return _Completed()
 
     monkeypatch.setattr(client, "run", run)
 
     await client.write_text("C:\\file.txt", "x" * 7000, timeout_s=1)
 
-    assert len(timeouts) == 3
-    assert timeouts[0] > timeouts[1] > timeouts[2]
+    assert len(timeouts) == 4
+    assert timeouts[0] > timeouts[1] > timeouts[2] > timeouts[3]
+
+
+async def test_windows_write_stages_chunks_then_replaces_resolved_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = SSHClient(
+        Capability(
+            name="shell",
+            protocol="ssh/2",
+            url="ssh://workspace.example:2222",
+            params={"shell": "powershell"},
+        ),
+        cast("asyncssh.SSHClientConnection", _Connection()),
+    )
+    destination = b"old"
+    staged = bytearray()
+    scripts: list[str] = []
+
+    async def run(command: object, **kwargs: object) -> _Completed:
+        nonlocal destination
+        assert kwargs["check"] is True
+        script = _decode_powershell(command)
+        scripts.append(script)
+        if "GetRandomFileName" in script:
+            return _Completed("C:\\work\\target.txt\nC:\\work\\.hud-write.tmp")
+        if match := re.search(r"FromBase64String\('([^']+)'\)", script):
+            assert "C:\\work\\.hud-write.tmp" in script
+            staged.extend(base64.b64decode(match.group(1)))
+        elif "[IO.File]::Replace" in script:
+            assert destination == b"old"
+            assert staged == b"new" * 3000
+            destination = bytes(staged)
+        return _Completed()
+
+    monkeypatch.setattr(client, "run", run)
+
+    await client.write_text("C:\\work\\link.txt", "new" * 3000, timeout_s=1)
+
+    assert destination == b"new" * 3000
+    assert "[IO.FileAttributes]::ReparsePoint" in scripts[0]
+    assert "$item.Target" in scripts[0]
+    assert all("C:\\work\\link.txt" not in script for script in scripts[1:])
+    assert ".GetOwner($p)" in scripts[-1]
+    assert "[Security.AccessControl.FileSecurity]::new()" in scripts[-1]
+    assert "$a.SetOwner($o)" in scripts[-1]
+    assert "$n=[System.Management.Automation.Language.NullString]::Value" in scripts[-1]
+    assert "[IO.File]::Replace($t,$d,$n)" in scripts[-1]
+
+
+async def test_windows_write_failure_during_staging_leaves_destination_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = SSHClient(
+        Capability(
+            name="shell",
+            protocol="ssh/2",
+            url="ssh://workspace.example:2222",
+            params={"shell": "powershell"},
+        ),
+        cast("asyncssh.SSHClientConnection", _Connection()),
+    )
+    destination = b"old"
+    staged = bytearray()
+
+    async def run(command: object, **kwargs: object) -> _Completed:
+        del kwargs
+        script = _decode_powershell(command)
+        if "GetRandomFileName" in script:
+            return _Completed("C:\\work\\target.txt\nC:\\work\\.hud-write.tmp")
+        if match := re.search(r"FromBase64String\('([^']+)'\)", script):
+            if staged:
+                assert "[IO.File]::Delete('C:\\work\\.hud-write.tmp')" in script
+                raise SSHConnectionError("connection lost during operation")
+            staged.extend(base64.b64decode(match.group(1)))
+        return _Completed()
+
+    monkeypatch.setattr(client, "run", run)
+
+    with pytest.raises(SSHConnectionError, match="connection lost"):
+        await client.write_text("C:\\work\\target.txt", "x" * 7000, timeout_s=1)
+
+    assert destination == b"old"
+    assert staged == b"x" * 6144
 
 
 async def test_close_during_reconnect_discards_the_replacement(

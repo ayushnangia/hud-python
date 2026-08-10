@@ -508,13 +508,15 @@ class _Forward(socketserver.BaseRequestHandler):
             _relay(self.request, upstream)
 
 
-class _UnixServer(socketserver.ThreadingUnixStreamServer):
-    daemon_threads = True
+if sys.platform != "win32":
 
-    def get_request(self) -> tuple[socket.socket, tuple[str, int]]:
-        # A unix peer has no address; the handler wants one to log.
-        request, _ = super().get_request()
-        return request, ("workspace", 0)
+    class _UnixServer(socketserver.ThreadingUnixStreamServer):
+        daemon_threads = True
+
+        def get_request(self) -> tuple[socket.socket, tuple[str, int]]:
+            # A unix peer has no address; the handler wants one to log.
+            request, _ = super().get_request()
+            return request, ("workspace", 0)
 
 
 class Egress:
@@ -547,7 +549,7 @@ class Egress:
         self.local_aliases = tuple(local_aliases)
         self.reserved_ports = frozenset(reserved_ports)
         self.token = token
-        self._servers: list[tuple[_UnixServer, Path]] = []
+        self._servers: list[tuple[socketserver.BaseServer, Path]] = []
 
     @property
     def socket_path(self) -> Path:
@@ -580,6 +582,8 @@ class Egress:
             )
 
     def _serve(self, path: Path, handler: type[socketserver.BaseRequestHandler]) -> None:
+        if sys.platform == "win32":
+            raise RuntimeError("workspace egress requires Unix domain sockets")
         with contextlib.suppress(FileNotFoundError):
             os.unlink(path)
         server = _UnixServer(str(path), handler)

@@ -8,7 +8,6 @@ import contextlib
 import json
 import logging
 import os
-import pty
 import shutil
 import socket
 import struct
@@ -17,6 +16,9 @@ from pathlib import Path
 from typing import Any, Literal
 
 import asyncssh
+
+if sys.platform != "win32":
+    import pty
 
 from hud.environment.utils import splice
 from hud.utils.process import ProcessGroup, ProcessResult, create_process_group_exec
@@ -504,6 +506,8 @@ class _NamespaceHost:
             *request["argv"],
         ]
         if channel.term_type:
+            if sys.platform == "win32":
+                raise RuntimeError("workspace namespace terminals require POSIX")
             master_fd, slave_fd = pty.openpty()
             process = await create_process_group_exec(
                 *argv,

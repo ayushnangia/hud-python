@@ -72,9 +72,10 @@ class _Conn:
                     stderr=f"cat: {parts[2]}: No such file or directory", exit_status=1
                 )
             return _Completed(stdout=self._store[parts[2]].decode())
-        if len(parts) == 3 and parts[:2] == ["cat", ">"]:
-            assert input is not None
-            self._store[parts[2]] = input.encode()
+        if input is not None and command.startswith("d=") and ".hud-write.XXXXXX" in command:
+            assignment = command.removeprefix("d=").partition(";n=0;")[0]
+            path = shlex.split(assignment)[0]
+            self._store[path] = input.encode()
             return _Completed()
         if len(parts) == 4 and parts[:3] == ["ls", "-1A", "--"]:
             prefix = parts[3].rstrip("/")

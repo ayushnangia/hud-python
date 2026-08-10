@@ -26,6 +26,29 @@ jobs:
       - name: Run tests
         run: uv run --python ${{ matrix.python-version }} --with=".[dev]" pytest --cov --cov-report=''
 
+  test-native-workspace:
+    name: Native Workspace (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-2022]
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+
+      - name: Install Python
+        run: uv python install 3.12
+
+      - name: Run native Workspace tests
+        run: >-
+          uv run --python 3.12 --with=".[dev]" pytest -q
+          hud/environment/tests/test_workspace_native.py
+
   lint-ruff:
     runs-on: ubuntu-latest
     steps:

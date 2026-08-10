@@ -59,6 +59,7 @@ class _FakeConn:
     def __init__(self, sink: dict[str, bytes], result: Any) -> None:
         self._sink = sink
         self._result = result
+        self._staged: dict[str, bytearray] = {}
         self.ran: list[str] = []
         self.write_commands: list[str] = []
 
@@ -85,10 +86,18 @@ class _FakeConn:
             )
             if input is not None:
                 self._sink[name] = input.encode()
+            elif "GetRandomFileName" in script:
+                self._staged[name] = bytearray()
+                return SimpleNamespace(
+                    stdout=f"{name}\n{name}.hud-write.tmp",
+                    stderr="",
+                    exit_status=0,
+                    returncode=0,
+                )
             elif match := re.search(r"FromBase64String\('([^']+)'\)", script):
-                self._sink[name] += base64.b64decode(match.group(1))
-            else:
-                self._sink[name] = b""
+                self._staged[name].extend(base64.b64decode(match.group(1)))
+            elif "[IO.File]::Replace" in script or "[IO.File]::Move" in script:
+                self._sink[name] = bytes(self._staged.pop(name))
             return SimpleNamespace(stdout="", stderr="", exit_status=0, returncode=0)
         self.ran.append(cmd)
         return self._result
@@ -172,7 +181,9 @@ async def test_exec_on_bash_runs_inline_without_batch() -> None:
     await agent._exec(run, ssh=ssh, shell="bash", mcp_servers={}, prompt="build it", max_steps=5)
 
     assert ".hud_run.bat" not in sink
-    assert conn.write_commands == ["cat > .hud_prompt.txt"]
+    assert len(conn.write_commands) == 1
+    assert ".hud_prompt.txt" in conn.write_commands[0]
+    assert ".hud-write.XXXXXX" in conn.write_commands[0]
     assert len(conn.ran) == 1
     assert "install.sh" in conn.ran[0]
     assert "claude" in conn.ran[0]
